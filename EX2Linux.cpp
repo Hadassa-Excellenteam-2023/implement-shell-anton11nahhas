@@ -8,31 +8,42 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <cstdlib>
+#include <iterator>
+#include <fcntl.h>
+#include <algorithm>
+#include <cstring>
 
 //----------------------------------FUNCTIONS----------------------------------------
 /**
- * this function recieves a string provided by the user which is the input, the function 
- * cleans the input from unnecessary charachters, creates a vector and stores the 
- * command in the first cell of the vector and the arguments afterwards.
- * the function returns the vector of tokens
-*/
+ * This function receives a string provided by the user as input. It cleans the input
+ * from unnecessary characters, creates a vector, and stores the command in the first
+ * element of the vector and the arguments afterwards.
+ * The function returns the vector of tokens.
+ */
 std::vector<std::string> tokenizeInput(const std::string& input) {
     std::vector<std::string> tokens;
-    std::istringstream iss(input); // create a stream object to tokenise input
+    std::istringstream iss(input); // Create a stream object to tokenize input
     std::string token;
     while (iss >> token) {
         tokens.push_back(token);
     }
+
+    // Remove the '&' character if it exists
+    if (!tokens.empty() && tokens.back() == "&") {
+        tokens.pop_back();
+    }
+
     return tokens;
 }
 
+
 //------------------------------------------------------------------------------------------
 /**
- * this function recieves a vector of strings full of tokens, create a new vector of char*
- * to store the arguments the user provided. loops through the tokens vector and extracts
- * the command and the arguments
- * the function returns the vector of char* of arguments.
-*/
+ * This function receives a vector of strings containing tokens and creates a new vector of char*
+ * to store the arguments provided by the user. It loops through the tokens vector and extracts
+ * the command and arguments.
+ * The function returns the vector of char* arguments.
+ */
 std::vector<char*> createArgs(const std::vector<std::string>& tokens) {
     std::vector<char*> args(tokens.size() + 1);
     for (size_t i = 0; i < tokens.size(); i++) {
@@ -46,8 +57,8 @@ std::vector<char*> createArgs(const std::vector<std::string>& tokens) {
 
 //------------------------------------------------------------------------------------------
 /**
- * this function recieves vector of char* and frees the memory allocated for it
-*/
+ * This function receives a vector of char* arguments and frees the memory allocated for it.
+ */
 void freeArgs(std::vector<char*>& args) {
     for (char* arg : args) {
         delete[] arg;
@@ -56,58 +67,142 @@ void freeArgs(std::vector<char*>& args) {
 
 //------------------------------------------------------------------------------------------
 /**
- * this function recieves the first cell of the vector char* which is the command, a vector of 
- * arguments which represent the arguments, a boolean value to see if the command must run on 
- * bg or fg, and a vector of pid_t whihc will store all processes ran in bg. the function's 
- * goal is to execute the command, the execvp uses PATHS to search for the command and executes it
- * if the path is not found an error is displayed to user, it first creates a process:
- * CHILD PROCESS: uses the execvp function to execute the command with the following arguments 
- * PARENT PROCESS: checks first if the process must run in bg or fg, if fg, it waits for the 
- *                  child process to finish, if bg, it does not need to wait the process keeps
- *                  running on bg, and appends the process to the vector of bgprocesses.
- * the function as well handles errors if any failures occur.
-*/
+ * This function receives the command (first element of the arguments vector), a vector of
+ * arguments, a boolean value to determine if the command must run in the background or foreground,
+ * and a vector of pid_t to store background processes.
+ * The function executes the command using the execvp function. It handles input and output
+ * redirection if requested by the user.
+ * -------- PART 2 --------
+ * Re-implemented this function so it can allow the user to use redirections and pipes as well.
+ * The child process now checks if the args vector consists of any of these operators '<' '>'
+ * '|' and accordingly uses the required system calls to fullfil the requirements if the found operator.
+ */
+
 void executeCommand(const std::string& command, std::vector<char*>& args, bool isBackground,
-                    std::vector<pid_t>& backgroundProcesses) {
-    pid_t pid = fork();
-    if(pid == 0){
-        //CHILD
-        if (execvp(command.c_str(), args.data()) == -1) {
-            perror("Command not found.");
+    std::vector<pid_t>& backgroundProcesses) {
+    try {
+        pid_t pid = fork();
+        if (pid == 0) {
+            // CHILD
+            int inputFd = -1;
+            auto inputIt = std::find_if(args.begin(), args.end(),
+                [](const char* arg) { return arg && std::string(arg) == "<"; });
+            if (inputIt != args.end() && std::next(inputIt) != args.end() && *std::next(inputIt)) {
+                inputFd = open(*std::next(inputIt), O_RDONLY);
+                if (inputFd == -1) {
+                    perror("Failed to open input file");
+                    exit(1);
+                }
+                dup2(inputFd, STDIN_FILENO);
+                args.erase(inputIt, std::next(inputIt, 2));
+            }
+
+            int outputFd = -1;
+            auto outputIt = std::find_if(args.begin(), args.end(),
+                [](const char* arg) { return arg && std::string(arg) == ">"; });
+            if (outputIt != args.end() && std::next(outputIt) != args.end() && *std::next(outputIt)) {
+                outputFd = open(*std::next(outputIt), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (outputFd == -1) {
+                    perror("Failed to open output file");
+                    exit(1);
+                }
+                dup2(outputFd, STDOUT_FILENO);
+                args.erase(outputIt, std::next(outputIt, 2));
+            }
+
+            int pipeIdx = -1;
+            for (size_t i = 0; i < args.size(); ++i) {
+                if (args[i] && std::string(args[i]) == "|") {
+                    pipeIdx = i;
+                    break;
+                }
+            }
+
+            if (pipeIdx != -1) {
+                std::vector<char*> leftArgs(args.begin(), args.begin() + pipeIdx);
+                std::vector<char*> rightArgs(args.begin() + pipeIdx + 1, args.end());
+
+                int pipefd[2];
+                if (pipe(pipefd) == -1) {
+                    perror("Pipe failed");
+                    exit(1);
+                }
+
+                pid_t childPid = fork();
+                if (childPid == 0) {
+                    close(pipefd[1]);
+                    dup2(pipefd[0], STDIN_FILENO);
+                    close(pipefd[0]);
+
+                    execvp(rightArgs[0], rightArgs.data());
+                    perror("Command not found.");
+                    exit(1);
+                }
+                else if (childPid > 0) {
+                    close(pipefd[0]);
+                    dup2(pipefd[1], STDOUT_FILENO);
+                    close(pipefd[1]);
+
+                    execvp(leftArgs[0], leftArgs.data());
+                    perror("Command not found.");
+                    exit(1);
+                }
+                else {
+                    perror("Creating a process failed.");
+                    exit(1);
+                }
+            }
+            else {
+                // Execute the command
+                if (args.size() > 0 && args[0]) {
+                    execvp(args[0], args.data());
+                    perror("Command not found.");
+                    exit(1);
+                }
+                else {
+                    std::cerr << "Invalid command." << std::endl;
+                    exit(1);
+                }
+            }
+        }
+        else if (pid > 0) {
+            // PARENT
+            if (isBackground) {
+                backgroundProcesses.push_back(pid);
+                std::cout << "Background process with PID " << pid << " started." << std::endl;
+            }
+            else {
+                waitpid(pid, nullptr, 0);
+            }
+        }
+        else {
+            perror("Creating a process failed.");
             exit(1);
         }
     }
-    else if(pid > 0){
-        //PARENT
-        if (isBackground) {
-            backgroundProcesses.push_back(pid); 
-        } else {
-            waitpid(pid, nullptr, 0);
-        }
-    }
-    else{
-        perror("Creating a process failed.");
+    catch (const std::exception& e) {
+        std::cerr << "Exception caught: " << e.what() << std::endl;
         exit(1);
     }
 }
 
 //------------------------------------------------------------------------------------------
 /**
- * this function receives a string which represents the input the user provided, and checks 
- * if the user wants to run the command on bg, it does so by checking if the user provided 
- * & at the end of the input, if so it returns true, meaning the command must run in bg, 
- * and false otherwise.
-*/
+ * This function receives a string representing the input provided by the user and checks if
+ * the user wants to run the command in the background. It does so by checking if the user
+ * provided '&' at the end of the input. If '&', the function returns true indicating that
+ * the command must run in the background; otherwise, it returns false.
+ */
 bool isBackgroundCommand(const std::string& input) {
-    return input.back() == '&';
+    return (!input.empty() && input.back() == '&');
 }
 
 //------------------------------------------------------------------------------------------
 /**
- * this function recieves a vector of process IDs, consisting of every vector running on 
- * background. the function displays the id of the process running on bg, as well as 
- * the status. it uses signals to retrieve this type of data.
-*/
+ * This function receives a vector of process IDs consisting of every process running in
+ * the background. The function displays the ID and status of each background process
+ * using signals.
+ */
 void myjobs(const std::vector<pid_t>& backgroundProcesses) {
     std::cout << "Background processes:" << std::endl;
     std::cout << "PID\tExit Status\tStatus" << std::endl;
@@ -119,11 +214,14 @@ void myjobs(const std::vector<pid_t>& backgroundProcesses) {
         if (result != -1) {
             if (WIFEXITED(status)) {
                 std::cout << pid << "\t" << WEXITSTATUS(status) << "\t\tExited" << std::endl;
-            } else if (WIFSIGNALED(status)) {
+            }
+            else if (WIFSIGNALED(status)) {
                 std::cout << pid << "\t" << WTERMSIG(status) << "\t\tTerminated" << std::endl;
-            } else if (WIFSTOPPED(status)) {
+            }
+            else if (WIFSTOPPED(status)) {
                 std::cout << pid << "\t\t\t\tStopped" << std::endl;
-            } else if (WIFCONTINUED(status)) {
+            }
+            else if (WIFCONTINUED(status)) {
                 std::cout << pid << "\t\t\t\tRunning" << std::endl;
             }
         }
@@ -133,41 +231,41 @@ void myjobs(const std::vector<pid_t>& backgroundProcesses) {
 //------------------------------------------------------------------------------------------
 
 /**
- * the main function that handles the input recieved from the user and then calls the 
- * necessary functions that implements a dummy shell.
-*/
+ * The main function handles the input received from the user and calls the necessary
+ * functions to implement a basic shell.
+ */
 int main() {
-    std::string input; // string to store the input from the user
-    bool isBg = false; // boolean varibale to indicated bg commands
-    std::vector<pid_t> backgroundProcesses; // Vector to store background process IDs
+    std::string input;
+    bool isBg = false;
+    std::vector<pid_t> backgroundProcesses;
 
     while (true) {
         std::cout << "Enter the command and arguments (or 'exit' to quit): ";
         std::getline(std::cin, input);
 
         if (input == "exit") {
-            break; // Break the loop if "exit" is entered
+            break;
         }
 
-        isBg = isBackgroundCommand(input); // call function to see if command must run in bg
+        isBg = isBackgroundCommand(input);
 
         if (input == "myjobs") {
             myjobs(backgroundProcesses);
-            continue; // Continue to the next iteration of the loop
+            continue;
         }
 
-        std::vector<std::string> tokens = tokenizeInput(input); // vector for tokens
+        std::vector<std::string> tokens = tokenizeInput(input);
 
         if (tokens.empty()) {
             std::cerr << "No command entered." << std::endl;
-            continue; // Continue to the next iteration of the loop
+            continue;
         }
 
-        std::vector<char*> args = createArgs(tokens); // call function to prepare args
+        std::vector<char*> args = createArgs(tokens);
 
         executeCommand(tokens[0], args, isBg, backgroundProcesses);
 
-        freeArgs(args); // free args
+        freeArgs(args);
     }
 
     return 0;
